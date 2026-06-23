@@ -1,7 +1,7 @@
 # X Automation.
 
 **Automated X/Twitter scripts for agent Ai.**
-https://img.shields.io/badge/X%20%2F%20Twitter-000000?style=for-the-badge&logo=x&logoColor=white
+[![X / Twitter](https://img.shields.io/badge/X%20%2F%20Twitter-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/username)
 ## Scripts
 
 | Script | Description |
