@@ -2,6 +2,10 @@
 
 **Automated X/Twitter scripts for agent Ai.**
 [![X / Twitter](https://img.shields.io/badge/X%20%2F%20Twitter-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/username)
+[![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-5B21B6?style=for-the-badge&logo=ghost&logoColor=white)](#)
+[![9router](https://img.shields.io/badge/9router-FF6B00?style=for-the-badge&logo=airplayaudio&logoColor=white)](#)
+[![Cloudflare AI](https://img.shields.io/badge/Cloudflare_AI-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](#)
+[![Playwright](https://img.shields.io/badge/Playwright-45ba4b?style=for-the-badge&logo=playwright&logoColor=white)](#)
 ## Scripts
 
 | Script | Description |
