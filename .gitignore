@@ -1,0 +1,28 @@
+# Credentials & cookies
+*.env
+.env*
+cookies/
+*_cookies.json
+*_cookie*.txt
+
+# API keys & secrets
+config.json
+secrets.json
+
+# State files
+*_state.json
+/tmp/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
