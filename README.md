@@ -1,6 +1,7 @@
 # X Automation.
 
 **Automated X/Twitter scripts for agent Ai.**
+
 [![X / Twitter](https://img.shields.io/badge/X%20%2F%20Twitter-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/username)
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-5B21B6?style=for-the-badge&logo=ghost&logoColor=white)](#)
 [![9router](https://img.shields.io/badge/9router-FF6B00?style=for-the-badge&logo=airplayaudio&logoColor=white)](#)
