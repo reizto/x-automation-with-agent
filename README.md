@@ -1,6 +1,6 @@
-# X Automation — @mhucex
+# X Automation.
 
-Automated X/Twitter scripts for account **@mhucex** running on AWS EC2 VPS.
+**Automated X/Twitter scripts for agent Ai.**
 
 ## Scripts
 
@@ -24,7 +24,7 @@ xvfb-run + Python script
     ↓
 Playwright (Firefox headless) → X/Twitter
     ↓
-LLM (9router OmbrO combo) → generate quote/reply text
+LLM (9router combo) → generate quote/reply text
     ↓
 Image Gen (CF Workers AI → Pollinations fallback) → attach image
     ↓
@@ -43,6 +43,8 @@ Box output → Telegram via Hermes cron delivery
 
 ## Setup
 
+You can send this repo to agent
+
 ### Requirements
 
 ```bash
@@ -59,7 +61,7 @@ Each script reads config from top of file:
 
 ```python
 LLM_API_KEY  = "<from 9router DB>"
-LLM_MODEL    = "OmbrO"  # 9router combo
+LLM_MODEL    = "YOUR MODEL"  # 9router combo
 LLM_BASE_URL = "http://127.0.0.1:20128/v1"
 COOKIE_FILE  = "/path/to/x_cookies.json"  # NOT committed
 ```
@@ -71,22 +73,9 @@ Obtain X/Twitter cookies via browser extension (EditThisCookie / Cookie-Editor),
 
 ## LLM Integration
 
-Uses [9router](https://github.com/reizto/9router) as local LLM proxy.
+Uses [9router] as local LLM proxy.
 
-**OmbrO combo** (round-robin, 13 models):
-- `openrouter/meta-llama/llama-3.3-70b-instruct` (~417ms)
-- `general/gpt-oss-120b` (~458ms)
-- `hugingface/meta-llama/Llama-3.3-70B-Instruct` (~487ms)
-- `openrouter/openai/gpt-4o` (~705ms)
-- `openrouter/google/gemini-2.5-flash` (~1037ms)
-- `openrouter/openai/gpt-4o-mini` (~1081ms)
-- `tokenrouter/openai/gpt-5.2` (~1125ms)
-- `openrouter/deepseek/deepseek-chat` (~1449ms)
-- `openrouter/anthropic/claude-opus-4-5` (~1581ms)
-- `virtuals/openai-gpt-52` (~1632ms)
-- `tokenrouter/anthropic/claude-sonnet-4.6` (~2045ms)
-- `virtuals/anthropic-claude-sonnet-4-6` (~2266ms)
-- `blues/gpt-4o` (~2460ms)
+**YOUR FAVORITE SETUP**
 
 ## Image Generation
 
