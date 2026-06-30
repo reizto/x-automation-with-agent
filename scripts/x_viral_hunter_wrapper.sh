@@ -1,14 +1,14 @@
 #!/bin/bash
 # Viral Tweet Hunter wrapper - auto-post with RANDOM delay (background)
 # Cron calls this → exits immediately → actual work runs detached later
-SCRIPT_DIR="/home/ubuntu/.hermes/scripts"
+SCRIPT_DIR="${X_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 # --- Human gate: aktif 06-23 WIB, skip 15% ---
 export TZ="Asia/Jakarta"
 
 # No random delay in wrapper (cron watchdog 120s)
 LOG_FILE="/tmp/x_viral_hunter_$(date +%Y%m%d_%H%M%S).log"
-timeout 70 xvfb-run -a /home/ubuntu/.hermes/hermes-agent/venv/bin/python3 "$SCRIPT_DIR/x_viral_tweet_hunter.py" \
+timeout 70 xvfb-run -a ${PYTHON:-python3} "$SCRIPT_DIR/x_viral_tweet_hunter.py" \
     --no-header-box >"$LOG_FILE" 2>&1
 RESULT=$?
 

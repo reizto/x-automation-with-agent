@@ -11,13 +11,14 @@ Image fallback chain:
   Pollinations AI (flux, free, no auth)
   image_gen Hermes tool (FAL/OpenAI backend)
 
-Run: python3 /home/ubuntu/.hermes/scripts/x_auto_post_tweet.py
+Run: python3 scripts/x_auto_post_tweet.py
 """
 
 import sys, os, json, random, subprocess, time
 
-sys.path.insert(0, "/home/ubuntu")
-SYS_PATH = "/home/ubuntu/last30days-skill/skills/last30days/scripts"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+SYS_PATH = os.environ.get("LAST30DAYS_SCRIPTS", "")
 
 # ── last30days research ────────────────────────────────────────
 # ── Dynamic niche buckets (growth mode) ───────────────────────
@@ -78,13 +79,20 @@ def research_topic() -> dict:
 
 # ── Draft tweet ─────────────────────────────────────────────────
 LLM_BASE_URL = "http://127.0.0.1:20128/v1"
-LLM_MODEL    = "virtuals/anthropic-claude-sonnet-4-6"
+# Fallback chain: try models in order until one works
+LLM_MODELS = [
+    "tokenrouter/anthropic/claude-sonnet-4.6",          # Primary (1.29s)
+    "tensormesh/deepseek-ai/DeepSeek-V4-Flash",         # Fast TensorMesh (0.40s)
+    "tokenrouter/openai/gpt-5.2",                       # Fast fallback (0.74s)
+    "hugingface/meta-llama/Llama-3.3-70B-Instruct",     # Fastest (0.38s)
+    "openrouter/openai/gpt-4o",                         # Reliable (1.21s)
+]
 
 def _get_llm_key() -> str:
     """Ambil API key aktif dari 9router DB secara dinamis."""
     try:
         import sqlite3 as _sq
-        db = _sq.connect("/home/ubuntu/.9router/db/data.sqlite")
+        db = _sq.connect(os.environ.get("ROUTER_DB_PATH", os.path.expanduser("~/.9router/db/data.sqlite")))
         row = db.execute("SELECT key FROM apiKeys WHERE isActive=1 ORDER BY createdAt LIMIT 1").fetchone()
         db.close()
         return row[0] if row else ""
@@ -92,32 +100,39 @@ def _get_llm_key() -> str:
         return ""
 
 def _call_llm(system: str, user: str, max_tokens: int = 280) -> str:
-    """Call 9router LLM. Returns text or empty string on failure."""
-    try:
-        import requests
-        key = _get_llm_key()
-        r = requests.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.9,
-                "stream": False,
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"LLM error: {e}")
+    """Call 9router LLM with fallback chain. Returns text or empty string on failure."""
+    import requests
+    key = _get_llm_key()
+    
+    for model in LLM_MODELS:
+        try:
+            r = requests.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.9,
+                    "stream": False,
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                resp = r.json()
+                if resp.get("choices") and resp["choices"][0]["message"]["content"].strip():
+                    return resp["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"LLM [{model}] failed: {e}, trying next...")
+            continue
+    
+    print("All LLM models failed, returning empty")
     return ""
 
 
@@ -189,7 +204,7 @@ def gen_cf_workers_ai(prompt: str, save_path: str) -> bool:
     try:
         import sqlite3, requests, base64
 
-        conn = sqlite3.connect("/home/ubuntu/.9router/db/data.sqlite")
+        conn = sqlite3.connect(os.environ.get("ROUTER_DB_PATH", os.path.expanduser("~/.9router/db/data.sqlite")))
         rows = conn.execute(
             "SELECT name, data FROM providerConnections WHERE isActive=1 AND provider='cloudflare-ai' ORDER BY RANDOM() LIMIT 3"
         ).fetchall()
@@ -321,83 +336,100 @@ def main():
         print(f"Outside 06:00-23:00 WIB (current: {h:02d}:{time.strftime('%M')}) exiting.")
         sys.exit(0)
 
-    print(f"{'='*50}")
-    print(f"X AUTO POST {time.strftime('%Y-%m-%d %H:%M:%S')} WIB")
-    print(f"{'='*50}")
+    # Time gate: 06:00-23:00 WIB
+    os.environ["TZ"] = "Asia/Jakarta"
+    time.tzset()
+    h = int(time.strftime("%H"))
+    if h < 6 or h >= 23:
+        # Silent exit outside hours
+        sys.exit(0)
 
-    # Delay dihapus — cron watchdog 120s tidak bisa akomodasi 3-15 menit
-    # apply_delay()
+    start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    end_ts = None
+    topic = ""
+    tweet_len = 0
+    tweet_source = "LLM"
+    image_provider = "None"
+    post_status = "❌ Failed"
+    post_url = ""
 
-    # 1. Research
-    research = research_topic()
-    print(f"Research done")
-    if research.get("error"):
-        print(f"Research error: {research['error']}")
+    try:
+        # 1. Research
+        research = research_topic()
+        if research.get("error"):
+            raise Exception(f"Research error: {research['error']}")
+        topic = research.get("topic", "")
 
-    # 2. Draft tweet
-    tweet = draft_tweet(research)
-    print(f"Tweet: {tweet['length']} chars")
+        # 2. Draft tweet
+        tweet = draft_tweet(research)
+        tweet_len = tweet["length"]
+        if "fallback" in tweet:
+            tweet_source = "Template fallback"
 
-    # 3. Generate image — kontekstual dari tweet + topic
-    topic_lower = tweet["topic"].lower()
-    tweet_text  = tweet["text"][:120]
+        # 3. Generate image
+        topic_lower = tweet["topic"].lower()
+        tweet_text  = tweet["text"][:120]
 
-    # Minta LLM bikin visual prompt yang nyambung sama konten
-    vis_system = (
-        "You are a prompt engineer for Stable Diffusion XL. "
-        "Convert the tweet topic into a cinematic image prompt. "
-        "Output ONLY the image prompt (max 120 chars). "
-        "Format: [subject], [style], [mood], [lighting]. No hashtags, no explanations."
-    )
-    vis_user = f"Tweet topic: {tweet['topic']}\nTweet: {tweet_text}\n\nImage prompt:"
-    visual_prompt = _call_llm(vis_system, vis_user, max_tokens=80)
+        vis_system = (
+            "You are a prompt engineer for Stable Diffusion XL. "
+            "Convert the tweet topic into a cinematic image prompt. "
+            "Output ONLY the image prompt (max 120 chars). "
+            "Format: [subject], [style], [mood], [lighting]. No hashtags, no explanations."
+        )
+        vis_user = f"Tweet topic: {tweet['topic']}\nTweet: {tweet_text}\n\nImage prompt:"
+        visual_prompt = _call_llm(vis_system, vis_user, max_tokens=80)
 
-    # Fallback kalau LLM gagal: keyword-based kontekstual
-    if not visual_prompt or len(visual_prompt) < 10:
-        if any(k in topic_lower for k in ["ai", "llm", "model", "agent", "openai", "nvidia"]):
-            visual_prompt = f"abstract AI neural network glowing digital brain, dark tech atmosphere, cinematic 4K"
-        elif any(k in topic_lower for k in ["bitcoin", "crypto", "eth", "defi", "solana", "blockchain"]):
-            visual_prompt = f"abstract cryptocurrency market chart volatility, dark trading floor, neon blue cinematic"
-        elif any(k in topic_lower for k in ["rate", "fed", "interest", "inflation", "dollar", "macro"]):
-            visual_prompt = f"wall street trading floor dim moody, economic data screens, cinematic photorealistic"
-        elif any(k in topic_lower for k in ["startup", "layoff", "burnout", "founder", "vc", "funding"]):
-            visual_prompt = f"empty startup office late night, single person working, moody cinematic lighting"
+        if not visual_prompt or len(visual_prompt) < 10:
+            if any(k in topic_lower for k in ["ai", "llm", "model", "agent", "openai", "nvidia"]):
+                visual_prompt = f"abstract AI neural network glowing digital brain, dark tech atmosphere, cinematic 4K"
+            elif any(k in topic_lower for k in ["bitcoin", "crypto", "eth", "defi", "solana", "blockchain"]):
+                visual_prompt = f"abstract cryptocurrency market chart volatility, dark trading floor, neon blue cinematic"
+            elif any(k in topic_lower for k in ["rate", "fed", "interest", "inflation", "dollar", "macro"]):
+                visual_prompt = f"wall street trading floor dim moody, economic data screens, cinematic photorealistic"
+            elif any(k in topic_lower for k in ["startup", "layoff", "burnout", "founder", "vc", "funding"]):
+                visual_prompt = f"empty startup office late night, single person working, moody cinematic lighting"
+            else:
+                visual_prompt = f"abstract {tweet['topic']} concept art, dark cinematic moody, photorealistic 4K"
+
+        img_path = "/tmp/auto_tweet_img.png"
+        img_ok, img_provider = generate_image(visual_prompt, img_path)
+        if img_ok:
+            image_provider = img_provider
         else:
-            visual_prompt = f"abstract {tweet['topic']} concept art, dark cinematic moody, photorealistic 4K"
+            img_path = None
 
-    print(f"Image prompt: {visual_prompt[:80]}...")
-    img_path = "/tmp/auto_tweet_img.png"
-    img_ok, img_provider = generate_image(visual_prompt, img_path)
+        # 4. Post to X
+        ok, msg = post_x(tweet["text"], image_path=img_path)
+        if ok:
+            post_status = "✅ Posted"
+            post_url = msg  # URL from post_tweet
+        else:
+            if img_path:
+                ok, msg = post_x(tweet["text"], image_path=None)
+                if ok:
+                    post_status = "✅ Posted (no image)"
+                    post_url = msg
 
-    if not img_ok:
-        img_path = None
-        print("All image providers failed, proceeding without image")
-    else:
-        print(f"Image ready: {img_provider}")
+    except Exception as e:
+        post_status = f"❌ Error: {str(e)[:40]}"
 
-    # 4. Post to X
-    print(f"Posting to X...")
-    ok, msg = post_x(tweet["text"], image_path=img_path)
-    if ok:
-        print(f"Posted successfully!")
-    else:
-        print(f"Post failed: {msg}")
-        if img_path:
-            print("Retry without image...")
-            ok, msg = post_x(tweet["text"], image_path=None)
-            if ok:
-                print(f"Posted (no image)!")
+    end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    duration = int(time.time() - time.mktime(time.strptime(start_ts, "%Y-%m-%d %H:%M:%S")))
 
-    # Cleanup
-    if img_path:
-        try:
-            if os.path.exists(img_path):
-                os.remove(img_path)
-        except:
-            pass
-
-    print(f"{'='*50}")
-    print(f"Done {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # Compact box output
+    print("```")
+    print("🚀 X AUTO POST")
+    print("━" * 48)
+    print(f"🕐 Start   : {start_ts}")
+    print(f"🕑 End     : {end_ts} ({duration}s)")
+    print(f"📝 Topic   : {topic}")
+    print(f"💬 Tweet   : {tweet_len} chars ({tweet_source})")
+    print(f"🖼️  Image   : {image_provider}")
+    print(f"📤 Status  : {post_status}")
+    if post_url:
+        print(f"🔗 URL     : {post_url}")
+    print("━" * 48)
+    print("```")
 
 
 if __name__ == "__main__":

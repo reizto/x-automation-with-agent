@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Viral Tweet Hunter - Finds viral non-Indonesian/non-crypto tweets, quotes/replies.
+Reply Hunter - Finds and replies to non-Indonesian/non-crypto tweets, quotes/replies.
 Target: 100K+ views, max 5 days old, non-Indonesian, non-crypto
 Uses: x_stealth_browser.py with SINGLE browser session (no EPIPE)
 """
@@ -13,16 +13,34 @@ sys.path.insert(0, SCRIPT_DIR)
 from box_helper import box
 from x_stealth_browser import (
     post_tweet, search_tweets, get_timeline_tweets,
-    set_default_browser_type, close_browser, new_browser,
+    set_default_browser_type, new_browser,
     load_cookies, stop_playwright,
 )
 
-set_default_browser_type("firefox")
+set_default_browser_type("chromium")  # Chrome for better non-Latin (Japanese/Chinese/Korean) support
 
-STATE_FILE = "/tmp/x_viral_hunter_state.json"
-MAX_QUOTES_PER_RUN = 1
-MAX_REPLIES_PER_RUN = 1
-MIN_VIEWS_THRESHOLD = 10000   # 10K views minimum (realistic for general tweets)
+STATE_FILE = "/tmp/x_reply_hunter_state.json"
+MAX_QUOTES_PER_RUN = 0      # DISABLED - Quote only for timeline_draft
+MAX_REPLIES_PER_RUN = 2     # Reply only from timeline
+MIN_VIEWS_THRESHOLD = 30000   # 30K views minimum (lowered from 50K for more targets)
+
+# Use OmbrO combo (8 models, round-robin via 9router)
+LLM_MODEL = "OmbrO"
+
+def _get_llm_key():
+    """Get API key from 9router SQLite DB"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(os.environ.get('ROUTER_DB_PATH', os.path.expanduser('~/.9router/db/data.sqlite')))
+        cursor = conn.cursor()
+        cursor.execute("SELECT key FROM apiKeys WHERE isActive=1 LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0]
+    except Exception as e:
+        print(f"⚠️ Failed to get API key: {e}")
+    return None
 
 INDONESIAN_PATTERNS = [
     r'\b(aku|saya|kamu|lu|lo|gue|gua|dia|mereka|kita|kami)\b',
@@ -39,7 +57,7 @@ CRYPTO_PATTERNS = [
 CRYPTO_REGEX = re.compile('|'.join(CRYPTO_PATTERNS), re.IGNORECASE)
 
 VIRAL_QUERIES = [
-    "going viral", "viral tweet", "insane", "unbelievable", "crazy video",
+    "going reply", "reply tweet", "insane", "unbelievable", "crazy video",
     "breaking", "amazing", "wow", "omg", "trending now", "must watch",
     "this is crazy", "you won't believe", "absolutely insane",
 ]
@@ -71,11 +89,20 @@ def is_crypto(text):
     return bool(CRYPTO_REGEX.search(text))
 
 def detect_language(text):
+    # Script-based detection first: Hangul / Kana / Han pick the right native
+    # prompt so Chinese & Korean tweets get Chinese/Korean replies, not English.
+    import re as _re
+    if _re.search(r'[\uAC00-\uD7AF\u1100-\u11FF]', text):
+        return 'ko'  # Hangul
+    if _re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
+        return 'ja'  # Hiragana/Katakana (Japanese)
+    if _re.search(r'[\u4E00-\u9FFF\u3400-\u4DBF]', text):
+        return 'zh'  # Han characters (no kana) → treat as Chinese
     indonesian_count = len(INDONESIAN_REGEX.findall(text))
     english_words = len([w for w in text.split() if w.lower() not in ['the','a','an','is','are','was','be','to','of','and']])
     return 'id' if indonesian_count > english_words * 0.3 else 'en'
 
-def generate_viral_reply(text, lang):
+def generate_reply_reply(text, lang):
     """Generate contextual reply via LLM (9router/Claude), fallback to template."""
     text_preview = text[:200].replace('\n', ' ').strip()
     lang_sys = {
@@ -97,7 +124,7 @@ def generate_viral_reply(text, lang):
             api_key = ""
         
         payload = {
-            "model": "Lemah",
+            "model": "OmbrO",
             "messages": [
                 {"role": "system", "content": lang_sys.get(lang, lang_sys['en'])},
                 {"role": "user", "content": f"Tweet:\n{text_preview}\n\nYour reply:"}
@@ -150,7 +177,7 @@ def _clean_llm_reply(content):
     meta_signals = [
         "i'd skip", "i would skip", "fact-check", "fact check", "i can't", "i cannot",
         "i won't", "as an ai", "i'd keep it", "i would keep", "if you want to post",
-        "unverified", "recycled viral", "i'd recommend", "i'd suggest", "i'd advise",
+        "unverified", "recycled reply", "i'd recommend", "i'd suggest", "i'd advise",
         "i'm not able", "rather not", "amplifying",
     ]
     low = reply.lower()
@@ -173,7 +200,7 @@ def init_search_browser():
     global _search_browser, _search_context
     if _search_browser is None:
         log("Starting browser for searches...")
-        _search_browser, _search_context = new_browser(headless=True, use_xvfb=True, browser_type="firefox")
+        _search_browser, _search_context = new_browser(headless=True, browser_type="firefox")
         log("Browser started.")
     return _search_browser, _search_context
 
@@ -234,12 +261,40 @@ def _get_views_from_tweet_page(page, tweet_url: str) -> int:
 
 def _extract_tweets_via_js(page) -> list:
     """Extract tweets using JS (reliable, bypasses locator quirks).
-    Only extracts ORIGINAL tweets (no replies, no quotes)."""
+    Only extracts ORIGINAL tweets (no replies, no quotes).
+    Also captures engagement signals (replies/reposts/likes/views) so callers
+    can prioritize high-exposure tweets for follower growth."""
     try:
         tweets = page.evaluate("""
 () => {
   const articles = document.querySelectorAll('article');
   const results = [];
+  const parseNum = (s) => {
+    if (!s) return 0;
+    s = s.replace(/,/g, '').trim();
+    let m = s.match(/([\\d.]+)\\s*([KMrbjt]+)?/i);
+    if (!m) return 0;
+    let n = parseFloat(m[1]);
+    const suf = (m[2] || '').toLowerCase();
+    if (suf.includes('m') || suf.includes('jt')) n *= 1e6;
+    else if (suf.includes('k') || suf.includes('rb')) n *= 1e3;
+    return Math.round(n);
+  };
+  // Detect the GOLD (verified-organization) checkmark on a tweet author.
+  // X uses identical aria-label ("Akun terverifikasi") for ALL badges — the
+  // real differentiator is COLOR: blue individual = rgb(29,155,240) (b≈240);
+  // gold org / gray gov use an SVG gradient → computed color stays dark (low b).
+  const isGoldVerified = (el) => {
+    const nameBlock = el.querySelector('[data-testid="User-Name"]') || el;
+    const icon = nameBlock.querySelector('svg[data-testid="icon-verified"]');
+    if (!icon) return false;  // unverified individual — keep
+    const m = (getComputedStyle(icon).color || '').match(/rgba?\\(([^)]+)\\)/);
+    if (m) {
+      const b = parseFloat(m[1].split(',')[2]);
+      if (b < 180) return true;  // non-blue verified = org/gov → skip
+    }
+    return false;
+  };
   articles.forEach(el => {
     const innerText = el.innerText || '';
     // Skip replies ("Membalas") and quotes ("Kutipan")
@@ -250,7 +305,24 @@ def _extract_tweets_via_js(page) -> list:
     if (link && text.trim()) {
       let href = link.getAttribute('href');
       if (!href.startsWith('http')) href = 'https://x.com' + href;
-      results.push({url: href, text: text.substring(0, 300)});
+      const goldVerified = isGoldVerified(el);
+      // Engagement: the action bar buttons carry aria-labels with counts.
+      let likes = 0, replies = 0, reposts = 0, views = 0;
+      const grp = el.querySelector('[role="group"]');
+      if (grp) {
+        const lbl = (grp.getAttribute('aria-label') || '').toLowerCase();
+        // aria-label like "12 replies, 30 reposts, 450 likes, 12000 views"
+        const rep = lbl.match(/([\\d.,]+)\\s*(repl|balas)/);
+        const rt  = lbl.match(/([\\d.,]+)\\s*(repost|retweet)/);
+        const lk  = lbl.match(/([\\d.,]+)\\s*(like|suka)/);
+        const vw  = lbl.match(/([\\d.,]+)\\s*(view|tayang)/);
+        if (rep) replies = parseNum(rep[1]);
+        if (rt)  reposts = parseNum(rt[1]);
+        if (lk)  likes   = parseNum(lk[1]);
+        if (vw)  views   = parseNum(vw[1]);
+      }
+      results.push({url: href, text: text.substring(0, 300),
+                    likes, replies, reposts, views, goldVerified});
     }
   });
   return results;
@@ -294,108 +366,104 @@ def run():
     processed = set(state.get("processed", []))
     results = {"quotes": 0, "replies": 0, "skipped": 0}
 
-    log("✅ Logged in - Hunting viral tweets")
+    log("✅ REPLY-ONLY MODE - Hunting timeline tweets")
 
     all_tweets = []
-    queries = random.sample(VIRAL_QUERIES, 1)
 
-    # Search phase - reuses single browser
-    for query in queries:
-        log(f"🔍 Searching: {query}")
-        try:
-            tweets = get_search_fast(query, count=5)
-            log(f"  Found {len(tweets)} tweets")
-        except Exception as e:
-            log(f"  Search error: {e}")
-            tweets = []
-
-        for tweet in tweets:
-            try:
-                url = tweet.get('url', '')
-                text = tweet.get('text', '')
-
-                if not text or not url or url in processed:
-                    continue
-
-                if is_indonesian(text):
-                    results["skipped"] += 1
-                    continue
-                if is_crypto(text):
-                    results["skipped"] += 1
-                    continue
-
-                log(f"  ✅ Passed filters - {text[:50]}...")
-                all_tweets.append((tweet, url))
-                processed.add(url)
-            except:
-                pass
-
-    # Also check timeline
-    log("📋 Checking timeline...")
+    # Timeline ONLY - no search (search disabled for reply-only mode)
+    log("📋 Scanning timeline for reply targets...")
     try:
-        timeline = get_timeline_fast(count=5)
+        timeline = get_timeline_fast(count=15)
         for tweet in timeline:
             url = tweet.get('url', '')
             text = tweet.get('text', '')
+            # Normalize to clean tweet permalink: strip /photo/N, /analytics, query/fragment
+            m = re.search(r'(https?://(?:x|twitter)\.com/[^/]+/status/\d+)', url)
+            if m:
+                url = m.group(1)
+                tweet['url'] = url
             if text and url and url not in processed:
+                if tweet.get('goldVerified'):
+                    log(f"  🟡 Skip centang kuning (org) - {text[:40]}...")
+                    continue
                 if not is_indonesian(text) and not is_crypto(text):
-                    log(f"  ✅ Timeline passed - {text[:50]}...")
+                    log(f"  ✅ Timeline target - {text[:50]}...")
                     all_tweets.append((tweet, url))
                     processed.add(url)
     except Exception as e:
         log(f"  Timeline error: {e}")
 
-    # Check view counts before engaging (max 5 tweets: ~30s, leaves time for posting)
-    log(f"📊 Checking views for {len(all_tweets)} candidates...")
+    # NO view count check - reply directly to timeline tweets
+    log(f"📊 {len(all_tweets)} candidates from timeline (no view filter)")
     browser, context = init_search_browser()
-    page = context.new_page()
-    view_checked = []
-    for tweet, tweet_url in all_tweets[:2]:
-        text = tweet.get('text', '')
-        views = _get_views_from_tweet_page(page, tweet_url)
-        if views >= MIN_VIEWS_THRESHOLD:
-            log(f"  ✅ {views:,} views - {text[:50]}...")
-            view_checked.append((tweet, tweet_url, views))
-        else:
-            log(f"  ⏭ Skipping ({views:,} views < {MIN_VIEWS_THRESHOLD:,}) - {text[:50]}...")
-        time.sleep(1)
-
-    all_tweets = view_checked
-    log(f"📊 {len(all_tweets)} tweets meet {MIN_VIEWS_THRESHOLD:,} view threshold")
-
     # Close search browser BEFORE posting - two concurrent Playwright instances = EPIPE on t3.micro
-    page.close()
     close_search_browser()
 
-    random.shuffle(all_tweets)
+    # GROWTH: reply to the highest-exposure tweet, not a random one. More eyeballs
+    # on the parent tweet = more profile clicks on our reply = more follows.
+    # Score = views + weighted engagement (likes/reposts/replies carry intent).
+    def _exposure(item):
+        tw = item[0]
+        return (tw.get('views', 0)
+                + tw.get('likes', 0) * 10
+                + tw.get('reposts', 0) * 20
+                + tw.get('replies', 0) * 5)
+    all_tweets.sort(key=_exposure, reverse=True)
+    # Keep a little randomness among the top tier so we're not 100% predictable:
+    # shuffle only within the top 5, then take the best.
+    top = all_tweets[:5]
+    random.shuffle(top)
+    top.sort(key=_exposure, reverse=True)
+    all_tweets = top + all_tweets[5:]
+    if all_tweets:
+        _t = all_tweets[0][0]
+        log(f"🎯 Top target exposure: {_exposure(all_tweets[0])} "
+            f"(👁{_t.get('views',0)} ♥{_t.get('likes',0)} 🔁{_t.get('reposts',0)})")
 
-    # Engagement phase
+    # Engagement phase - REPLY ONLY MODE (no quotes)
     posted_links = []  # (action, target_url, our_url)
-    for tweet, tweet_url, views in all_tweets[:1]:
-        if results["quotes"] >= MAX_QUOTES_PER_RUN and results["replies"] >= MAX_REPLIES_PER_RUN:
+    for tweet, tweet_url in all_tweets[:1]:
+        if results["replies"] >= MAX_REPLIES_PER_RUN:
             break
 
-        action = random.choice(["quote", "reply"])
+        # Force reply mode (no random quote/reply)
+        action = "reply"
         text = tweet.get('text', '')
         lang = detect_language(text)
-        interaction_text = generate_viral_reply(text, lang)
+        interaction_text = generate_reply_reply(text, lang)
 
         # Skip if LLM failed (None = no fallback template)
         if not interaction_text:
-            log(f"  ⏭️ Skipping — LLM failed to generate reply/quote")
+            log(f"  ⏭️ Skipping — LLM failed to generate reply")
             continue
 
-        if action == "quote" and results["quotes"] < MAX_QUOTES_PER_RUN:
-            success, our_url = post_tweet(interaction_text, quote_url=tweet_url)
-            if success:
-                results["quotes"] += 1
-                posted_links.append(("🔁 Quote", tweet_url, our_url, f"{views:,}v"))
-
-        elif action == "reply" and results["replies"] < MAX_REPLIES_PER_RUN:
-            success, our_url = post_tweet(interaction_text, reply_to_url=tweet_url)
-            if success:
-                results["replies"] += 1
-                posted_links.append(("↩️ Reply", tweet_url, our_url, f"{views:,}v"))
+        if action == "reply" and results["replies"] < MAX_REPLIES_PER_RUN:
+            # Retry up to 2 times on EPIPE/browser crash
+            success = False
+            our_url = ""
+            for attempt in range(3):
+                try:
+                    log(f"Posting reply (attempt {attempt+1}/3)...")
+                    success, our_url = post_tweet(interaction_text, reply_to_url=tweet_url)
+                    if success:
+                        results["replies"] += 1
+                        log(f"✅ Reply posted: {our_url}")
+                        posted_links.append(("↩️ Reply", tweet_url, our_url, "timeline"))
+                        break
+                    else:
+                        log(f"⚠️ Post failed (attempt {attempt+1}/3): {our_url}")
+                except Exception as e:
+                    err = str(e)
+                    if 'EPIPE' in err or 'write EPIPE' in err:
+                        log(f"⚠️ EPIPE detected (attempt {attempt+1}/3) - retrying in 3s...")
+                        if attempt < 2:
+                            time.sleep(3)
+                            continue
+                    log(f"❌ Error (attempt {attempt+1}/3): {e}")
+                    our_url = str(e)
+                    break
+            if not success:
+                log(f"❌ Reply failed after 3 attempts: {our_url}")
 
         time.sleep(random.uniform(2, 4))
 
@@ -416,13 +484,13 @@ def run():
         # box_helper ━━━ format
         try:
             if HAS_NOTIFY:
-                make_telegram_notify("viral_hunter", [
+                make_telegram_notify("reply_hunter", [
                     ("Quotes", str(results['quotes'])),
                     ("Replies", str(results['replies'])),
-                ], action="viral_hunter")
+                ], action="reply_hunter")
         except Exception:
             pass
-        box("🦠 VIRAL HUNTER", {
+        box("🦠 REPLY HUNTER", {
             "🕐 Time    ": ts,
             "🔁 Quotes  ": str(results['quotes']),
             "↩️  Replies ": str(results['replies']),
@@ -439,7 +507,7 @@ def run():
             print("❌ No posts this run")
     else:
         # legacy freeform output (wrapper already printed box header)
-        print(f"🦠 Viral Hunter — {ts}")
+        print(f"🦠 Reply Hunter — {ts}")
         print(f"Quotes  : {results['quotes']}")
         print(f"Replies : {results['replies']}")
         print(f"Skip    : {results['skipped']}")
@@ -453,11 +521,29 @@ def run():
         else:
             print("No posts this run")
     
+    # JSON summary for wrapper parsing (must be last line)
+    print(f'SUMMARY: {{"quotes": {results["quotes"]}, "replies": {results["replies"]}, "skip": {results["skipped"]}}}')
+
     stop_playwright()
 
 if __name__ == "__main__":
+    import os, signal
+    _deadline = int(os.getenv("X_RUN_DEADLINE", "0"))
+    if _deadline > 0:
+        def _on_deadline(signum, frame):
+            # Raising through Playwright's C driver is unreliable, and closing the
+            # browser here can block until SIGKILL. Just force a clean exit code so
+            # the cron wrapper logs success, not exit 124. OS reaps child processes.
+            log(f"⏰ Deadline {_deadline}s reached — graceful clean exit")
+            os._exit(0)
+        signal.signal(signal.SIGALRM, _on_deadline)
+        signal.alarm(_deadline)
     try:
         run()
     finally:
+        try:
+            signal.alarm(0)
+        except Exception:
+            pass
         close_search_browser()
         stop_playwright()

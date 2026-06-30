@@ -17,7 +17,8 @@ from datetime import datetime
 from pathlib import Path
 
 # Import stealth browser functions
-sys.path.insert(0, "/home/ubuntu")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 from x_stealth_browser import (
     post_tweet,
     get_tweet_views_detail,
@@ -33,20 +34,46 @@ BROWSER_TYPE = os.environ.get("BROWSER_TYPE", "firefox")
 # Auto-post mode: post directly without draft approval
 DRAFT_MODE = False
 
+# Module-level run counters so the SIGALRM deadline handler can emit an
+# ACCURATE per-run summary even when main() exits early via os._exit().
+quote_count = 0
+reply_count = 0
+
 # Telegram config (for reporting only)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = "1039204485"
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # LLM config for contextual quote tweets
-# Use Hermes API key (ombro.my.id/v1) — always active
+# Use OmbrO combo (23 models, round-robin)
 LLM_API_URL = os.environ.get("LLM_API_URL", "http://127.0.0.1:20128/v1")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")  # set via env or fetched from 9router DB
-LLM_MODEL = os.environ.get("LLM_MODEL", "Lemah")
+LLM_API_KEY = None  # fetched from 9router DB
+LLM_MODEL = os.environ.get("LLM_MODEL", "OmbrO")
+
+def _get_llm_key():
+    """Get API key from 9router SQLite DB"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(os.environ.get('ROUTER_DB_PATH', os.path.expanduser('~/.9router/db/data.sqlite')))
+        cursor = conn.cursor()
+        cursor.execute("SELECT key FROM apiKeys WHERE isActive=1 LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0]
+    except Exception as e:
+        print(f"⚠️ Failed to get API key: {e}")
+    return None
+
+# Fallback chain for LLM calls (max 3 models for speed)
+LLM_MODELS = [
+    "virtuals/google-gemini-3-5-flash",  # fast, stable
+    "OmbrO",                               # local combo fallback
+]
 
 # Config
-MAX_INTERACTIONS_PER_RUN = 1  # Total interactions (quote + reply) - reduced for cron timeout
+MAX_INTERACTIONS_PER_RUN = 1  # Total interactions per run - keep it 1 for stability
 MAX_QUOTE_TWEETS_PER_RUN = 1  # Max quote tweets per run
-MAX_REPLIES_PER_RUN = 1       # Max replies per run
+MAX_REPLIES_PER_RUN = 0       # No replies (quote-only mode)
 MIN_VIEWS_THRESHOLD = 50000    # Minimum view count to engage (50k)
 ENABLE_VIEW_SCRAPE = False     # DISABLED: terlalu lambat (buka browser baru per tweet), boros 20-30s/tweet
 
@@ -133,19 +160,20 @@ def detect_language(text):
     if not text:
         return "en"
     
-    # Japanese (Hiragana/Katakana/Kanji)
-    jp_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', text))
-    if jp_chars > 5:
-        return "ja"
-    
-    # Korean (Hangul)
+    # Korean (Hangul) — check first, no overlap with CJK Han
     kr_chars = len(re.findall(r'[\uac00-\ud7af]', text))
-    if kr_chars > 5:
+    if kr_chars > 3:
         return "ko"
-    
-    # Chinese (simplified/traditional)
-    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-    if cn_chars > 10:
+
+    # Japanese — REQUIRE kana (hiragana/katakana). Kanji alone is ambiguous with
+    # Chinese, so don't count Han here or Chinese tweets misdetect as Japanese.
+    kana_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
+    if kana_chars > 2:
+        return "ja"
+
+    # Chinese (Han characters, no kana present)
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+    if cn_chars > 3:
         return "zh"
     
     # Arabic
@@ -273,9 +301,57 @@ def generate_reply_draft(text, category, lang="en"):
     return draft
 
 
-def generate_contextual_quote(text, lang="en", author=""):
-    """Generate contextual reply/quote using local LLM - CHATTY/OPINION style"""
+def _analyze_image(image_url, lang="en"):
+    """Ask a vision-capable model what's IN the tweet image, so the quote can
+    react to the actual visual content (charts, scoreboards, photos), not just
+    the text. Returns a short factual description, or '' on any failure.
+    Many JP/sports/entertainment tweets are image-first — text alone misses the point."""
+    if not image_url:
+        return ""
+    import requests as _rq
+    from json import JSONDecoder as _JD
+    api_key = _get_llm_key()
+    # Vision-capable models verified working on the gateway (Jun 2026).
+    vision_models = ["tokenrouter/anthropic/claude-sonnet-4.6", "tokenrouter/openai/gpt-5.4", "OmbrO"]
+    sys_prompt = ("Describe what is actually shown in this image in ONE concise factual sentence "
+                  "(max 25 words). Focus on concrete content: who/what, any visible numbers, text, "
+                  "charts, scores, or actions. No interpretation, no fluff.")
+    for model in vision_models:
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": sys_prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]}],
+                "max_tokens": 80, "temperature": 0.4, "stream": False,
+            }
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            r = _rq.post(f"{LLM_API_URL}/chat/completions", headers=headers, json=payload, timeout=12)
+            if r.status_code == 200:
+                obj, _ = _JD().raw_decode(r.text)
+                if obj.get('choices') and obj['choices'][0].get('message'):
+                    desc = (obj['choices'][0]['message'].get('content') or '').strip()
+                    # Reject models that refuse / can't see images
+                    low = desc.lower()
+                    if desc and len(desc) > 12 and "can't view" not in low and "cannot view" not in low and "i'm sorry" not in low:
+                        print(f"  🖼️ Image analyzed [{model.split('/')[-1]}]: {desc[:80]}")
+                        return desc[:200]
+        except Exception as e:
+            print(f"  vision [{model}] failed: {e}")
+            continue
+    return ""
+
+def generate_contextual_quote(text, lang="en", author="", image_url=""):
+    """Generate contextual reply/quote using local LLM - CHATTY/OPINION style.
+    If the tweet has an image, analyze it FIRST (vision) and fold the visual
+    content into the prompt so the quote reacts to what's actually shown."""
     text_preview = text[:200].replace('\n', ' ').strip()
+
+    # Vision pre-step: see the image before writing the comment.
+    image_desc = _analyze_image(image_url, lang) if image_url else ""
 
     lang_prompts = {
         "en": f"You are a sharp, opinionated person on X with strong takes. Read the tweet and reply with 1-2 punchy sentences (max 200 chars). State a clear take, push back, or add real context — not just agreeing or hyping. Vary your style: sometimes ask a rhetorical question, sometimes state a counterintuitive fact, sometimes call out the unspoken implication. Never repeat the same phrasing pattern. No filler phrases ('this hits', 'needed this', 'take this as a sign', 'the story here', 'people don't realize', 'the framing matters', 'the context left out'). No emoji unless it adds meaning. No hashtags. Output ONLY the reply.\n\nTweet by @{author}: {text_preview}",
@@ -289,74 +365,57 @@ def generate_contextual_quote(text, lang="en", author=""):
         "ar": f"أنت شخص مباشر وذو رأي على X. اقرأ التغريدة ورد بجملة واحدة حازمة (أقصى 120 حرفاً). أعطِ موقفاً واضحاً، ناقض، أو أضف سياقاً حقيقياً — لا مجرد موافقة أو مديح. بدون عبارات فارغة. بدون هاشتاق. فقط نص الرد.\nمثال: تغريدة: 'رفضوني من شغل أحلامي' -> 'هذا الرفض على الأرجح أنقذك من ستة أشهر من الندم'\nمثال: تغريدة: 'أبل تطلق آيفون جديد' -> 'توقيت الإعلان مصمم لتحريك سعر السهم لا لإطلاق المنتج'\n\nتغريدة @{author}: {text_preview}",
     }
     
-    try:
-        import requests, sqlite3
-        # Use Hermes API key directly — always active, bypass 9Router state
-        api_key = LLM_API_KEY
-        
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": lang_prompts.get(lang, lang_prompts["en"])},
-                {"role": "user", "content": f"Reply to this tweet with 1-2 punchy sentences (max 200 chars). State a clear take or insight — not agreement or hype. Vary your phrasing. No filler phrases. No hashtags.\n\nTweet:\n{text_preview}"}
-            ],
-            "max_tokens": 200,
-            "temperature": 0.95,
-            "stream": False
-        }
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        response = requests.post(
-            f"{LLM_API_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        response.raise_for_status()
-        
-        quote_text = ""
-        try:
-            obj = response.json()
-            if 'choices' in obj:
-                msg = obj['choices'][0].get('message', {})
-                content = str(msg.get('content', ''))
-                
-                # Strip thinking tags (<think>...</think>) — LemahOmbrO may include them
-                import re as _re
-                content = _re.sub(r'<think>.*?</think>', '', content, flags=_re.DOTALL).strip()
-                
-                # Find actual reply - check multiple patterns
-                reply_candidate = content
-                
-                # Skip empty/think-only/single-char content
-                clean = reply_candidate.strip()
-                if clean and len(clean) > 3 and not clean.startswith(('http', 'www', '/', '\\n')) and not all(c in ' \n\t' for c in clean):
-                    quote_text = clean[:300]
-        except Exception:
-            pass
-
-        if not quote_text:
-            raise Exception("Empty LLM response")
-        # Early leak check before sanitizer (faster fail)
-        _low = quote_text.lower()
-        EARLY_LEAKS = ["i'm claude","claude code","language model","as an ai","i can't post","i cannot post","anthropic","i don't have access","social media platform","i'm an ai","i am an ai"]
-        if any(m in _low for m in EARLY_LEAKS):
-            raise Exception("LLM leaked identity/refusal")
-
-        quote_text = sanitize_reply(quote_text)
-        if not quote_text:
-            raise Exception("Sanitizer rejected response (cliché/empty)")
-
-        if len(quote_text) > 280:
-            quote_text = quote_text[:277] + "..."
-            
-        log(f"🤖 LLM: {quote_text[:80]}")
-        return quote_text
-        
-    except Exception as e:
-        log(f"⚠️ LLM failed: {e} — skipping post")
+    
+    import requests, re as _re
+    api_key = _get_llm_key()
+    if not api_key:
+        print("⚠️ No API key available")
         return None
+    
+    # Try each model in fallback chain
+    # Fold the vision result into the user message so the text model reacts to
+    # what the image SHOWS, not just the caption.
+    _img_block = f"\n\nThe tweet includes an image showing: {image_desc}" if image_desc else ""
+    user_msg = (f"Reply to this tweet with 1-2 punchy sentences (max 200 chars). "
+                f"No filler. No hashtags.\n\nTweet:\n{text_preview}{_img_block}")
+    for model in LLM_MODELS:
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": lang_prompts.get(lang, lang_prompts["en"])},
+                    {"role": "user", "content": user_msg}
+                ],
+                "max_tokens": 200,
+                "temperature": 0.95,
+                "stream": False
+            }
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            
+            r = requests.post(f"{LLM_API_URL}/chat/completions", headers=headers, json=payload, timeout=4)
+            
+            if r.status_code == 200:
+                obj = r.json()
+                if obj.get('choices') and obj['choices'][0].get('message'):
+                    content = obj['choices'][0]['message'].get('content', '').strip()
+                    content = _re.sub(r'<think>.*?</think>', '', content, flags=_re.DOTALL).strip()
+                    content = content.strip().strip('"').strip("'").strip()
+                    # Reject degenerate output: a quote caption must be substantive
+                    # ("tegas dan berisi"). Count meaningful chars (drop URLs, @,
+                    # whitespace, lone emoji). Short junk like "W" / "AI" — which is
+                    # also the residue of a CJK unicode-drop — must NOT be posted.
+                    meaningful = _re.sub(r'https?://\S+|@\w+|[\s\W_]+', '', content)
+                    if content and len(meaningful) >= 8:
+                        return content[:300]
+                    print(f"  ⏭️ Rejected too-short/degenerate quote: {content!r}")
+        except Exception as e:
+            print(f"LLM [{model}] failed: {e}, trying next...")
+            continue
+    
+    print("All LLM models failed for quote generation")
+    return ""
 
 CLICHES = [
     "this hits different", "we are so back", "this is huge", "game changer",
@@ -477,6 +536,7 @@ def main():
     state = get_state()
     processed = set(state.get("processed_urls", []))
     
+    global quote_count, reply_count
     quote_count = 0
     reply_count = 0
     skipped_count = 0
@@ -495,67 +555,70 @@ def main():
         log(f"Added {len(search_results)} search results")
     
     for tweet in tweets:
-            if (quote_count + reply_count) >= MAX_INTERACTIONS_PER_RUN:
-                break
+        if (quote_count + reply_count) >= MAX_INTERACTIONS_PER_RUN:
+            break
 
-            text = tweet.get('text', '')
-            url = tweet.get('url', '')
-            author = tweet.get('author', '')
+        text = tweet.get('text', '')
+        url = tweet.get('url', '')
+        author = tweet.get('author', '')
+        image_url = tweet.get('imageUrl', '') or tweet.get('image_url', '')
 
-            if not text or not url or url in processed:
+        if not text or not url or url in processed:
                 continue
 
-            # Normalize URL: strip /analytics, /photo/N, query params, etc.
-            # These suffixes break post_tweet() navigation
-            url = re.sub(r'(\.com/\w+/status/\d+)(?:/analytics|/photo/\d+).*', r'\1', url)
+        # Skip centang kuning (verified organization / brand account)
+        if tweet.get('goldVerified'):
+                skipped_count += 1
+                log(f"  🟡 Skip centang kuning (org): {text[:50]}...")
+                continue
 
-            # Filters
-            if is_crypto(text):
+        # Normalize URL: strip /analytics, /photo/N, query params, etc.
+        # These suffixes break post_tweet() navigation
+        url = re.sub(r'(\.com/\w+/status/\d+)(?:/analytics|/photo/\d+).*', r'\1', url)
+
+        # Filters
+        if is_crypto(text):
                 skipped_count += 1
                 log(f"  ⏭️ Skipped crypto: {text[:50]}...")
                 continue
-            if is_indonesian(text):
+        if is_indonesian(text):
                 skipped_count += 1
                 log(f"  ⏭️ Skipped Indonesian: {text[:50]}...")
                 continue
 
-            # View threshold check
-            if ENABLE_VIEW_SCRAPE:
+        # View threshold check
+        if ENABLE_VIEW_SCRAPE:
                 views = get_tweet_views_detail(url, browser_type=BROWSER_TYPE)
                 if views < MIN_VIEWS_THRESHOLD:
                     skipped_count += 1
                     log(f"  ⏭️ Skipped low views ({views:,}) < {MIN_VIEWS_THRESHOLD:,}: {text[:50]}...")
                     continue
                 log(f"  ✅ Passed content filters ({views:,} views) - {text[:50]}...")
-            else:
+        else:
                 log(f"  ✅ Passed content filters - {text[:50]}...")
 
-            # Detect language
-            lang = detect_language(text)
+        # Detect language
+        lang = detect_language(text)
 
-            # Generate contextual reply/quote text using LLM
-            interaction_text = generate_contextual_quote(text, lang, author.split('@')[0] if '@' in author else author.split('\n')[0])
+        # Generate contextual quote text using LLM (QUOTE-ONLY MODE)
+        # Pass image_url so the LLM analyzes the tweet's image FIRST, then
+        # writes a comment that reacts to the actual visual content.
+        interaction_text = generate_contextual_quote(text, lang, author.split('@')[0] if '@' in author else author.split('\n')[0], image_url=image_url)
 
-            # Skip if LLM failed (None = no fallback template)
-            if not interaction_text:
-                log(f"  ⏭️ Skipping — LLM failed to generate reply/quote")
+        # Skip if LLM failed (None = no fallback template)
+        if not interaction_text:
+                log(f"  ⏭️ Skipping — LLM failed to generate quote")
                 continue
 
-            # Randomly choose: quote tweet or reply
-            action = "quote" if random.random() < 0.5 else "reply"
+        # QUOTE-ONLY MODE - always quote, never reply
+        action = "quote"
 
-            # Respect individual limits
-            if action == "quote" and quote_count >= MAX_QUOTE_TWEETS_PER_RUN:
-                action = "reply"
-            elif action == "reply" and reply_count >= MAX_REPLIES_PER_RUN:
-                action = "quote"
-
-            # If both at limit, break
-            if quote_count >= MAX_QUOTE_TWEETS_PER_RUN and reply_count >= MAX_REPLIES_PER_RUN:
+        # Respect quote limit
+        if quote_count >= MAX_QUOTE_TWEETS_PER_RUN:
                 break
 
-            # --- DRAFT MODE: save candidate for approval, do NOT post ---
-            if DRAFT_MODE:
+        # --- DRAFT MODE: save candidate for approval, do NOT post ---
+        if DRAFT_MODE:
                 pending = {
                     "action": action,
                     "url": url,
@@ -575,7 +638,7 @@ def main():
                 _print_draft_card(pending)
                 return
 
-            try:
+        try:
                 success = False
                 if action == "quote":
                     log(f"Posting quote tweet ({lang}): @{author}: {text[:60]}...")
@@ -595,14 +658,14 @@ def main():
                 else:
                     errors.append(f"Failed to {action}: {url}")
 
-            except Exception as e:
+        except Exception as e:
                 log(f"Error posting {action}: {e}")
                 errors.append(f"Error {action}: {e}")
 
-            processed.add(url)
+        processed.add(url)
 
-            # Small delay between interactions
-            time.sleep(random.uniform(1, 2))
+        # Small delay between interactions
+        time.sleep(random.uniform(1, 2))
 
     # Report results
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -622,12 +685,42 @@ def main():
             print(f"  ❌ {err[:80]}")
     
     log(f"Done! Posted {quote_count} quotes, {reply_count} replies")
+    # Fresh per-run summary line for the wrapper to parse (NOT stale state file).
+    print(f"SUMMARY: {{\"quotes\": {quote_count}, \"replies\": {reply_count}}}", flush=True)
     
-    # Save state
+    # Save state with counters
     state["processed_urls"] = list(processed)[-100:]
+    state["quotes"] = quote_count
+    state["replies"] = reply_count
+    state["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_state(state)
     
     log("Done!")
 
 if __name__ == "__main__":
-    main()
+    import signal
+    _deadline = int(os.getenv("X_RUN_DEADLINE", "0"))
+    if _deadline > 0:
+        def _on_deadline(signum, frame):
+            # Raising through Playwright's C driver is unreliable, and closing the
+            # browser here can block until SIGKILL. Emit a fresh, ACCURATE summary
+            # from the live counters, then force a clean exit. Exit code reflects
+            # whether anything actually landed so the wrapper can't falsely report
+            # "Posted" when the deadline hit mid-attempt with 0 posts.
+            log(f"⏰ Deadline {_deadline}s reached — graceful clean exit")
+            print(f"SUMMARY: {{\"quotes\": {quote_count}, \"replies\": {reply_count}}}", flush=True)
+            os._exit(0 if (quote_count + reply_count) > 0 else 2)
+        signal.signal(signal.SIGALRM, _on_deadline)
+        signal.alarm(_deadline)
+    try:
+        main()
+    finally:
+        try:
+            signal.alarm(0)
+        except Exception:
+            pass
+        try:
+            from x_stealth_browser import stop_playwright
+            stop_playwright()
+        except Exception:
+            pass

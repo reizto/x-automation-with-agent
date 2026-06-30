@@ -1,103 +1,69 @@
-# X Automation.
+# X Automation
 
-**Automated X/Twitter scripts for agent Ai.**
+Automated X/Twitter scripts for Playwright-based posting, replies, quotes, video reposts, cookie health checks, and views tracking.
 
-[![X / Twitter](https://img.shields.io/badge/X%20%2F%20Twitter-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/username)
-[![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-5B21B6?style=for-the-badge&logo=ghost&logoColor=white)](#)
-[![9router](https://img.shields.io/badge/9router-FF6B00?style=for-the-badge&logo=airplayaudio&logoColor=white)](#)
-[![Cloudflare AI](https://img.shields.io/badge/Cloudflare_AI-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](#)
-[![Playwright](https://img.shields.io/badge/Playwright-45ba4b?style=for-the-badge&logo=playwright&logoColor=white)](#)
 ## Scripts
 
 | Script | Description |
-|--------|-------------|
-| `x_timeline_draft.py` | Fetches For You timeline, generates contextual quote tweets & replies via LLM |
-| `x_viral_tweet_hunter.py` | Hunts viral tweets (50k+ views), generates replies/quotes |
-| `x_auto_post_tweet.py` | Auto-posts original tweets with AI-generated image (research → draft → image → post) |
-| `x_timeline_draft_wrapper.sh` | Cron wrapper for timeline script — formats output for Telegram delivery |
-| `x_viral_hunter_wrapper.sh` | Cron wrapper for viral hunter |
-| `box_helper.sh` | Shared helper for box-formatted terminal output |
+|---|---|
+| `x_timeline_draft.py` | Reads timeline candidates and posts contextual quote/reply content |
+| `x_reply_hunter.py` | Finds reply targets and posts concise contextual replies |
+| `x_video_repost.py` | Downloads selected X videos and reposts with generated captions |
+| `x_auto_post_tweet.py` | Research → draft → optional image → original X post |
+| `x_cookie_health_check.py` | Verifies X cookie/session health |
+| `x_views_tracker.py` | Tracks weekly view/impression snapshots |
+| `*_wrapper.sh` / `*_worker.sh` | Cron-safe wrappers and detached workers |
+| `x_stealth_browser.py` | Shared browser/session automation engine |
+| `x_tg_notify.sh` | Optional Telegram notification helper via env vars |
+| `box_helper.sh` | Compact box-format output helper |
 
-## Architecture
-
-```
-Cron (hourly)
-    ↓
-wrapper.sh (timeout 90s)
-    ↓
-xvfb-run + Python script
-    ↓
-Playwright (Firefox headless) → X/Twitter
-    ↓
-LLM (9router combo) → generate quote/reply text
-    ↓
-Image Gen (CF Workers AI → Pollinations fallback) → attach image
-    ↓
-Post tweet/reply/quote
-    ↓
-Box output → Telegram via Hermes cron delivery
-```
-
-## Cron Schedule
-
-```
-0  * * * *  Timeline Auto Quote/Reply  (top of hour)
-30 * * * *  Viral Tweet Hunter         (half hour)
-0  3 * * *  Cookie Health Check        (daily 03:00 WIB)
-```
-
-## Setup
-
-You can send this repo to agent
-
-### Requirements
+## Requirements
 
 ```bash
-# Python packages
-pip install playwright requests
-
-# Install Firefox for Playwright
-python3 -m playwright install firefox
+python3 -m venv .venv
+. .venv/bin/activate
+pip install playwright requests yt-dlp
+python3 -m playwright install firefox chromium
 ```
 
-### Config (per script)
+System tools commonly needed:
 
-Each script reads config from top of file:
-
-```python
-LLM_API_KEY  = "<from 9router DB>"
-LLM_MODEL    = "YOUR MODEL"  # 9router combo
-LLM_BASE_URL = "http://127.0.0.1:20128/v1"
-COOKIE_FILE  = "/path/to/x_cookies.json"  # NOT committed
+```bash
+sudo apt-get install -y xvfb ffmpeg
 ```
 
-### Cookie File
+## Configuration
 
-Obtain X/Twitter cookies via browser extension (EditThisCookie / Cookie-Editor), save as JSON.
-**Never commit cookie files to this repo.**
+Set runtime values through environment variables. Do **not** commit cookies, tokens, DB files, or local profile paths.
 
-## LLM Integration
+```bash
+export X_COOKIE_FILE="/secure/path/to/x_cookies.json"
+export X_COOKIE_PERSISTENT="/secure/path/to/persistent_x_cookies.json"   # optional
+export X_WEB_BEARER="<x-web-public-bearer-if-using-graphql-api>"          # optional
+export ROUTER_DB_PATH="$HOME/.9router/db/data.sqlite"                    # optional
+export LLM_API_URL="http://127.0.0.1:20128/v1"
+export LLM_MODEL="OmbrO"
+export TELEGRAM_BOT_TOKEN="<telegram-bot-token>"                         # optional
+export X_TG_CHAT="<telegram-chat-id>"                                     # optional
+export X_TG_THREAD="<telegram-thread-id>"                                 # optional
+export YT_DLP_BIN="$(command -v yt-dlp)"                                  # optional
+```
 
-Uses [9router] as local LLM proxy.
+## Cron Pattern
 
-**YOUR FAVORITE SETUP**
+Use wrappers for scheduled jobs; workers handle longer posting flows and self-notification.
 
-## Image Generation
+```cron
+# examples only — adjust to your account limits and active hours
+3,36 6-22 * * *  bash scripts/x_reply_hunter_wrapper.sh
+2,32 * * * *     bash scripts/x_timeline_draft_wrapper.sh
+0,30 6-22 * * *  bash scripts/x_video_repost_wrapper.sh
+37 6-21/5 * * *  bash scripts/x_auto_post_wrapper.sh
+```
 
-**Provider chain (x_auto_post_tweet.py):**
-1. 🥇 CF Workers AI — Flux-1-schnell (23 accounts rotating)
-2. 🥈 Pollinations AI — free, no auth (`image.pollinations.ai`)
+## Safety
 
-## Posting Behavior
-
-- **LLM fail** → skip post (no fallback template)
-- **Tone** → assertive, opinionated, substantive — no hype/filler
-- **Language** → English only for public posts
-- **Source link** → always included for news/research posts
-- **View threshold** → 50k minimum for viral hunter
-
-## Notes
-
-- `xvfb-run` required (headless display for Firefox/Playwright)
-- Wrapper `timeout 90s` — must complete before Hermes cron watchdog (120s)
-- Random internal delay (3-15s) to avoid predictable patterns
+- Never commit `X_COOKIE_FILE`, cookie JSON, `.env`, API keys, bot tokens, local DBs, or browser profiles.
+- Keep account-specific IDs and Telegram destinations in environment variables.
+- Validate with `python3 -m py_compile scripts/*.py` before pushing.
+- For live automation, test one script manually before enabling cron.
